@@ -1,0 +1,356 @@
+🌐 «Свой Интернет» — Полная документация
+Сетевой стек RTL8139 с DNS-сервером
+*(Загрузка с floppy → 32-bit protected mode → QEMU user-mode networking)*
+
+📐 1. Архитектура системы
+text
+┌─────────────────────────────────────────────────────────────────┐
+│  Хост (Windows 10)                                              │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  QEMU (qemu-system-i386 11.0.0)                           │  │
+│  │  ┌──────────────┐      ┌──────────────────────────────┐  │  │
+│  │  │ bootloader   │─────▶│ boot.s                       │  │  │
+│  │  │ (512 байт)   │      │ • RTL8139 driver             │  │  │
+│  │  │ 16-bit real  │      │ • ICMP + ARP + DNS           │  │  │
+│  │  └──────────────┘      │ • 32-bit protected mode      │  │  │
+│  │                        │ • Размер: 1536 байт           │  │  │
+│  │                        └───────────────┬──────────────┘  │  │
+│  │                                        │                  │  │
+│  │  ┌─────────────────────────────────────▼──────────────┐  │  │
+│  │  │  RTL8139 (эмулированный)                           │  │  │
+│  │  │  • PCI ID: 10EC:8139                               │  │  │
+│  │  │  • IO порт: 0xC000                                 │  │  │
+│  │  │  • RX ring: 0x4000 – 0x5FFF                       │  │  │
+│  │  │  • TX buffer: 0x5800                               │  │  │
+│  │  └──────────────┬─────────────────────────────────────┘  │  │
+│  │                 │ filter-dump → traffic.pcap              │  │
+│  │  ┌──────────────▼─────────────────────────────────────┐  │  │
+│  │  │  slirp (user-mode networking)                      │  │  │
+│  │  │  • hostfwd udp::23000-:5353                        │  │  │
+│  │  │  • Встроенный NAT + DNS proxy                      │  │  │
+│  │  └──────────────┬─────────────────────────────────────┘  │  │
+│  └─────────────────┼────────────────────────────────────────┘  │
+│                    │ loopback (127.0.0.1)                      │
+│  ┌─────────────────▼──────────────────────────────────────┐   │
+│  │  PowerShell / Python UDP-клиент                        │   │
+│  │  • Шлёт DNS-запрос  → порт 23000                       │   │
+│  │  • Получает ответ  ← порт 23000                        │   │
+│  └────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+🚀 2. Загрузчик (bootloader.asm — 115 строк, 512 байт)
+Этап	Описание
+1	INT 13h AH=02h — чтение 64 секторов (32 КБ) с CHS (C=0, H=0, S=2) в память 0x1000–0x8FFF
+2	Включение A20 Gate через порт 0x92 (бит 1)
+3	Загрузка GDT с flat-моделью:
+• 08h — код (RX)
+• 10h — данные (RW)
+• 18h — код (RX)
+4	jmp 0x08:pmode → переход в 32-bit → jmp 0x08:0x1000 (передача управления boot.s)
+Параметры CHS: CL=2, CH=0, DH=0, 64 итерации. Чтение до 0x9000.
+
+🔧 3. Драйвер RTL8139 (boot.s — 551 строка, 1536 байт)
+3.1 Регистры чипа
+Регистр	Адрес	Назначение
+TSD0–3	0x10–0x1C	TxStatus — запись размера + запуск TX
+TSAD0–3	0x20–0x2C	TxAddr — физический адрес TX-буфера
+RBSTART	0x30	Базовый адрес RX-кольца
+CMD	0x37	Команды: 0x10=reset, 0x0C=TX+RX enable
+CAPR	0x38	Current Address of Packet Read (не писать!)
+CBR	0x3A	Current Buffer Address (указатель записи чипа)
+IMR	0x3C	Маска прерываний (5 = ROK + TOK)
+ISR	0x3E	Статус прерываний (биты: 0=ROK, 2=TxOK)
+RCR	0x44	RX-конфигурация (0x0F = Accept All)
+CFG9346	0x50	EEPROM-доступ (0xC0 = unlock)
+CONFIG1	0x52	Бит 6 = 0x40 (IBWE) — IO barrier
+3.2 Карта памяти
+Адрес	Назначение	Размер
+0x0000	Обнулённая область	1024 Б
+0x1000	boot.s (код + данные)	1536 Б
+0x4000	RX-кольцо	8208 Б
+0x5000	TX_BUF1 (не используется)	2048 Б
+0x5800	TX_BUF2 (ICMP, ARP, DNS)	2048 Б
+0x6000	VARS: IO_BASE, PKT_LEN, RX_PTR	16+ Б
+0x7000	PKT_BUF (буфер приёма)	4096 Б
+0x8000	STACK_TOP (стек растёт вниз)	—
+3.3 Инициализация (rtl_init)
+c
+CMD = 0x10;          // Software reset
+while (CMD & 0x10);  // Ждём выхода из reset
+
+CFG9346 = 0xC0;      // Unlock EEPROM
+CONFIG1 |= 0x40;     // IBWE
+CFG9346 = 0x00;      // Lock EEPROM
+
+RBSTART = 0x4000;    // RX ring base
+CAPR = 0;            // Инициализация (больше не писать!)
+
+RCR = 0x0F;          // AcceptAll
+IMR = 5;             // ROK + TxOK
+CMD = 0x0C;          // TX Enable + RX Enable
+3.4 Приём пакетов (read_rx)
+c
+if (CBR - RX_PTR > 0) {
+    // Читаем 32-битный RX-заголовок
+    frame_length = (RX_ring[RX_PTR] >> 16) & 0xFFFF;
+    
+    // Копируем данные в PKT_BUF
+    memcpy(PKT_BUF, RX_ring + RX_PTR + 4, frame_length);
+    
+    // Продвигаем указатель
+    RX_PTR += frame_length + 4;
+}
+⚠️ Критическое правило: Никогда не пишем в CAPR после инициализации. QEMU rtl8139 останавливает RX при любой записи в CAPR.
+
+3.5 Передача пакетов (rtl_tx)
+c
+void rtl_tx(void* buffer, int size) {
+    TSAD[desc_index] = TX_BUF2;   // Физический адрес
+    TSD[desc_index] = size;       // Размер пакета
+    
+    wait_for(ISR & 0x04);         // Ждём TxOK
+    ISR = 4;                      // Сбрасываем бит
+}
+Примечание: QEMU использует внутренний currTxDesc для выбора дескриптора. После каждого TX он инкрементится.
+
+3.6 PCI-скан (pci_find)
+c
+for (dev = 0; dev < 256; dev++) {
+    outl(0xCF8, 0x80000000 | (dev << 11));
+    if (inl(0xCF4) == 0x813910EC) {  // Vendor:Device
+        // Включаем Bus Master
+        outl(0xCF8, 0x80000000 | (dev << 11) | 0x04);
+        outl(0xCF4, inl(0xCF4) | 0x04);
+        
+        // Читаем BAR0 → IO base = 0xC000
+        outl(0xCF8, 0x80000000 | (dev << 11) | 0x10);
+        io_base = inl(0xCF4) & 0xFFF0;
+        break;
+    }
+}
+📡 4. Сетевые протоколы
+4.1 Ethernet-фрейм
+text
+┌──────────┬──────────┬────────────┬──────────────────┐
+│ dst MAC  │ src MAC  │ EtherType  │     Payload      │
+│ (6 байт) │ (6 байт) │ (2 байта)  │ (46–1500 байт)   │
+├──────────┼──────────┼────────────┼──────────────────┤
+│ 52:54... │ 52:55... │ 0x0800/IP  │  IPv4            │
+│          │          │ 0x0806/ARP │  ARP             │
+└──────────┴──────────┴────────────┴──────────────────┘
+MAC-адреса:
+
+Наш: 52:54:00:12:34:56
+
+QEMU slirp: 52:55:0A:00:02:02
+
+4.2 ARP (Address Resolution Protocol)
+text
+[14-15] 0x0001     HTYPE = Ethernet
+[16-17] 0x0800     PTYPE = IPv4
+[18]    6          HLEN
+[19]    4          PLEN
+[20-21] OPER       (0x0001=Request, 0x0002=Reply)
+[22-27] Sender MAC
+[28-31] Sender IP
+[32-37] Target MAC
+[38-41] Target IP
+Наша логика:
+Если OPER == 0x0001 и Target IP == 10.0.2.15 → отправляем ARP Reply с нашей MAC и IP.
+
+4.3 IPv4
+text
+[14+0]   0x45            Version=4, IHL=5
+[14+2-3] Total Length    (big-endian)
+[14+8]   0x40            TTL=64
+[14+9]   Protocol        (0x11=UDP, 0x01=ICMP, 0x06=TCP)
+[14+10-11] Header Checksum
+[14+12-15] Source IP
+[14+16-19] Destination IP
+IP checksum: 16-bit ones' complement над 10 словами (20 байт заголовка).
+
+4.4 ICMP Echo
+text
+[34] 0x08           Type = Echo Request
+[35] 0x00           Code
+[36-37] Checksum
+[38-39] Identifier  (0x0100)
+[40-41] Sequence    (0x0100)
+
+→ Ответ: Type = 0x00 (Echo Reply)
+💡 Зачем нужен ICMP: При загрузке отправляем ICMP Echo (ping) для инициализации NAT-маппинга в QEMU slirp. Без этого ответный трафик не проходит.
+
+4.5 UDP
+text
+[42-43] Source Port
+[44-45] Destination Port
+[46-47] Length (включая 8 байт заголовка)
+[48-49] Checksum (0 = disabled)
+Примечание: UDP checksum = 0 (законно для IPv4).
+
+4.6 DNS
+Запрос (клиент → наш сервер:5353)
+text
+[42-43] ID           0x1234
+[44-45] Flags        0x0100 (standard query)
+[46-47] QDCOUNT      1
+[48-49] ANCOUNT      0
+[50-51] NSCOUNT      0
+[52-53] ARCOUNT      0
+[54+]   Question:
+        - QNAME (length-prefixed labels, заканчивается 0x00)
+        - QTYPE (2 байта: 0x0001 = A)
+        - QCLASS (2 байта: 0x0001 = IN)
+Ответ (наш сервер → клиенту)
+Поле	Значение	Пояснение
+ID	Копия из запроса	—
+Flags	0x8180	Response + No Error
+QDCOUNT	Копия	—
+ANCOUNT	1	Один ответ
+Question	Копия	—
+Answer:		
+└ Name	0xC00C	Compression pointer
+└ Type	0x0001	A record
+└ Class	0x0001	IN
+└ TTL	0x0000012C	300 секунд
+└ rdlength	0x0004	4 байта
+└ rdata	10.0.2.15 → 0x0A00020F	IPv4 адрес
+🛠️ 5. Технологический стек
+Компонент	Назначение	Версия
+NASM	Ассемблер	2.16+
+MinGW GCC	Кросс-компилятор C	—
+ld.bfd	Компоновщик (PE-i386 → binary)	—
+objcopy	PE → raw binary	—
+dd	Сборка floppy-образа	—
+QEMU	Эмуляция	11.0.0
+PowerShell	UDP-клиент	—
+Python	Разбор pcap	3.x
+⚙️ 6. Инструментарий
+Ассемблер (NASM)
+bash
+nasm -f bin -o boot.bin boot.s
+nasm -f win32 -o entry.o entry.asm
+C-ядро (GCC)
+bash
+x86_64-w64-mingw32-gcc -m32 -Os -ffreestanding -nostdlib -nostdinc -fno-pie -c kernel.c -o kernel.o
+Компоновка
+bash
+ld.bfd -m i386pe --oformat pe-i386 \
+  --section-start=.text=0x1000 \
+  --section-start=.bss=0x3000 \
+  -o kernel.pe entry.o kernel.o
+objcopy -O binary kernel.pe kernel.bin
+QEMU
+bash
+qemu-system-i386 -fda floppy.img -boot a -no-reboot \
+  -m 32 \
+  -debugcon file:qemu_debug.log \
+  -netdev user,id=mynet,hostfwd=udp::23000-:5353 \
+  -device rtl8139,netdev=mynet \
+  -object filter-dump,id=dump0,netdev=mynet,file=traffic.pcap
+Запуск (Makefile)
+bash
+make          # Сборка floppy.img
+make run      # QEMU с -nographic -debugcon stdio
+🧪 7. Ручное тестирование
+PowerShell UDP-клиент
+powershell
+$udp = New-Object System.Net.Sockets.UdpClient
+$ep = [System.Net.IPEndPoint]::new([IPAddress]::Loopback, 23000)
+
+# DNS-запрос example.com A
+$query = [byte[]]@(
+    0x12,0x34,              # ID
+    0x01,0x00,              # Flags
+    0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,  # QD=1
+    0x07,'e','x','a','m','p','l','e',         # "example"
+    0x03,'c','o','m',                         # "com"
+    0x00,                                      # null
+    0x00,0x01,0x00,0x01                       # A+IN
+)
+
+$udp.Send($query, $query.Length, $ep)
+Start-Sleep -Milliseconds 500
+$response = $udp.Receive([ref]$ep)
+# Ожидаем DNS-ответ с ID=0x1234, flags=0x8180
+Python pcap-анализ
+python
+import struct
+
+def parse_pcap(filename):
+    with open(filename, 'rb') as f:
+        data = f.read()
+    
+    off = 24  # Пропускаем глобальный заголовок pcap
+    pkts = []
+    
+    while off + 16 <= len(data):
+        ts_sec, ts_usec, incl, orig = struct.unpack('<IIII', data[off:off+16])
+        off += 16
+        pkt = data[off:off+incl]
+        off += incl
+        
+        eth_type = struct.unpack('>H', pkt[12:14])[0]
+        pkts.append({'len': incl, 'eth_type': eth_type, 'data': pkt})
+    
+    return pkts
+📊 8. Поток пакетов (pcap: 6 пакетов, ~500 байт)
+#	Размер	Протокол	Src → Dst	Описание
+1	42 Б	ICMP Echo	10.0.2.15 → 10.0.2.2	Инициализация NAT-маппинга
+2	60 Б	ARP Request	10.0.2.2 → broadcast	"Кто 10.0.2.15?"
+3	60 Б	ARP Reply	10.0.2.15 → 10.0.2.2	"Я 52:54:00:12:34:56"
+4	60 Б	ICMP Reply	10.0.2.2 → 10.0.2.15	Ответ на пинг
+5	71 Б	DNS Query	10.0.2.2 → 10.0.2.15:5353	example.com A
+6	87 Б	DNS Response	10.0.2.15:5353 → 10.0.2.2	ID=0x1234, AN=1
+🐛 9. Отладка
+Debugcon (порт 0xE9)
+asm
+dbg_c:  mov dx, 0xE9
+        out dx, al
+        ret
+Отладочные символы:
+
+R — RTL инициализация завершена
+
+S — перед отправкой DNS-ответа
+
+D — после отправки DNS-ответа
+
+Проверка состояния чипа
+asm
+inw(io + 0x3E)   ; ISR — статус прерываний
+inw(io + 0x3A)   ; CBR — указатель записи чипа
+inb(io + 0x37)   ; CMD — режим TX/RX
+📏 10. Размеры и ограничения
+Модуль	Размер	Формат
+bootloader.asm	512 Б	flat binary (MBR)
+boot.s	1536 Б	flat binary (3 сектора)
+kernel.c	253 строки	C source
+entry.asm	16 строк	только стек + вызов
+kernel.bin	~1700+ Б	raw binary (с BSS)
+floppy.img	1.44 МБ	FAT12 (raw)
+⚠️ 11. Известные ограничения
+№	Ограничение	Причина
+1	Только 3 TX-дескриптора (0,1,2)	4-й не инициализирован
+2	UDP checksum = 0	Снижает целостность (но законно)
+3	Один RX-пакет за раз	Нет очереди для множественных RX
+4	MAC-адрес захардкожен	Чтение IDR0 заняло бы место
+5	Протестировано только в QEMU	Может не работать на реальном железе
+6	boot.s — ровно 1536 байт	Нет места для расширения
+7	ARP отвечает только на 10.0.2.15	Не поддерживается несколько IP
+8	DNS отвечает только A-записью	Нет CNAME, MX, IPv6
+🏁 12. Итог
+Проект реализует полноценный сетевой стек в 32-битном protected mode на голом железе:
+
+text
+Аппаратура → PCI → RTL8139 → Ethernet → IP → UDP → DNS
+    ↓                                                    ↓
+bootloader.asm → boot.s (NASM) → QEMU → slirp → хост-клиент
+Стек самостоятельно (без ОС):
+
+🔍 Сканирует PCI и инициализирует RTL8139
+
+📦 Обрабатывает ARP, ICMP, IP, UDP
+
+🌐 Отвечает на внешние DNS-запросы A-записями с IP 10.0.2.15
+
+🔄 Взаимодействует с QEMU user-mode networking
